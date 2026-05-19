@@ -411,6 +411,19 @@ Search SE24 with the pattern `/SCMTMS/*HELPER*` to find over 160 available helpe
 
 The skeleton below shows all five rules applied together.
 Replace `<placeholders>` with the actual BO, node, and field constants for the target scenario.
+Modularize a method with:
+1. Declarations
+  a. Type definitions
+  b. COnstants declaration
+  c. Data or variable declarations
+  d. defining field symbols
+2. Clear any exporting parameters of the method
+3. Instantiation of any required reference data
+4. Any check conditions
+5. Fetch required data using select statements for Non-BO related data and retrive all BO related data using Service manager
+6. Fill Modification tab as per the logic or an action
+7. Perfom modifications calling modify on service manager and get any failed or error messages
+8. Call save using Transaction manager and if it gets rejected, get all the failed keys and respective error messages
 
 ```abap
 METHOD <your_method_name>.
@@ -492,6 +505,12 @@ METHOD <your_method_name>.
 
   IF lv_rejected = abap_true.
     " handle rejection
+    " ── Rule 5: Helper for message propagation ──────────────────────────────────
+    IF lo_message IS BOUND.
+      /scmtms/cl_common_helper=>msg_helper_add_mo(
+        EXPORTING io_new_message = lo_message
+        CHANGING  co_message     = eo_message ).
+    ENDIF.
   ENDIF.
 
 ENDMETHOD.
