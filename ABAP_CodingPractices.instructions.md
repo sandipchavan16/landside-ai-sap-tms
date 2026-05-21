@@ -1,6 +1,5 @@
 # ABAP Coding Practice Instructions for AI Agent
 
-> Based on: [ABAP Best Practices by ilyakaznacheev](https://ilyakaznacheev.github.io/abap-best-practice/)
 >
 > **Purpose:** This instruction file governs how you, as an AI coding agent, must write, review, and suggest ABAP code. Always apply every rule in this document. When generating code, flag any violation you deliberately omit and explain why.
 
