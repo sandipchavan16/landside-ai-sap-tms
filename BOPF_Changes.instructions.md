@@ -649,7 +649,7 @@ Replace `<placeholders>` with the actual BO, node, and field constants for the t
 Modularize a method with:
 1. Declarations
   a. Type definitions
-  b. COnstants declaration
+  b. Constants declaration
   c. Data or variable declarations
   d. defining field symbols
 2. Clear any exporting parameters of the method
