@@ -2,7 +2,7 @@
 
 Generate correct, upgrade-safe ABAP for SAP TM 9.x / S/4HANA TM using the **BOPF Consumer API only**. The five rules below are non-negotiable. They sit on top of `ABAP_CodingPractices.instructions.md` (Clean ABAP, 7.40+, abap-cleaner) and `NamingConventions.instructions.md`.
 
-> **Naming**: local vars use Clean ABAP names (no `lv_`/`lt_`/`lo_`/`ls_`). The `iv_`/`it_`/`et_`/`eo_`/`es_`/`is_` prefixes below are **fixed `/BOBF/` API parameter names** — write them exactly.
+> **Naming**: local vars use Clean ABAP names (no `lv_`/`lt_`/`lo_`/`ls_`). The `iv_`/`it_`/`et_`/`eo_`/`es_`/`is_`/`io_`/`co_`/`ct_` prefixes below are **fixed `/BOBF/` API parameter names** — write them exactly.
 
 ## Rule 1 — Service Manager: instantiate once, reuse
 Obtain via `/BOBF/CL_TRA_SERV_MGR_FACTORY`. Reuse any reference already in scope (parameter/attribute/earlier in method); never create a second one for the same BO key in one execution context.
@@ -12,6 +12,8 @@ IF service_manager IS NOT BOUND.
 ENDIF.
 ```
 **BO keys**: TRQ (Forwarding Order) `/scmtms/if_trq_c=>sc_bo_key`; TOR (Freight Order/Unit/Booking) `/scmtms/if_tor_c=>sc_bo_key`; Freight Agreement `/scmtms/if_freightagreement_c=>sc_bo_key`. For others use `sc_bo_key` from `/SCMTMS/IF_<BO>_C`.
+
+> **Important — inside Actions/Determinations/Validations of the same BO, do NOT use the Service Manager.** The framework passes `io_read` (and `io_modify` for Actions) which already operate on the current LUW buffer. See **Rule 6**.
 
 ## Rule 2 — Data retrieval: QUERY / RETRIEVE / RETRIEVE_BY_ASSOCIATION only
 **Never SELECT on TM BO tables** — always go through the buffer. Flow: QUERY → RETRIEVE / RBA. Inside Actions/Determinations/Validations the framework passes `it_key`, so QUERY is usually not needed.
@@ -145,10 +147,160 @@ ENDIF.
 Search SE24 `/SCMTMS/*HELPER*` (160+ helpers) first.
 - **Messages**: set `SY-MSG*` via classic `MESSAGE … INTO`, then `/scmtms/cl_common_helper=>msg_helper_add_symsg` (or `…_add_mo` to merge a message object) into `co_message`.
 - **DO key mapping**: `…=>get_do_keys_4_rba` (Rule 2c).
-- **Modification table**: `/SCMTMS/CL_MOD_HELPER` methods build `ct_modification` — prefer over manual `VALUE #( … )`.
+- **Modification table**: `/SCMTMS/CL_MOD_HELPER` methods build `ct_modification` — prefer over manual `VALUE #( … )`. In particular `mod_update_single` / `mod_create_single` / `mod_delete_single` return a typed `es_mod` line that you `APPEND` to your `mod_tab`.
 - Domain helpers: `…_TOR_HELPER_STAGE` (stages/stops), `…_TOR_HELPER_CHACO` (change-controller casting).
 
-## End-to-end skeleton
+## Rule 6 — Inside Action / Determination / Validation classes: use `io_read` / `io_modify`, NOT the Service Manager
+When you implement an Action (`/BOBF/IF_FRW_ACTION~EXECUTE`), Determination (`~EXECUTE`) or Validation (`~EXECUTE`) **for the same BO**, the framework passes runtime handles that already operate on the current transaction buffer:
+
+| Handle | Role | Available in |
+|---|---|---|
+| `io_read`   TYPE REF TO `/bobf/if_frw_read`   | reads (RETRIEVE / RBA / CONVERT_ALTERN_KEY) | Actions, Determinations, Validations, Custom Queries |
+| `io_modify` TYPE REF TO `/bobf/if_frw_modify` | writes (DO_MODIFY) | Actions, Determinations (only consistency-enabling ones) |
+| `io_atomic` TYPE REF TO `/bobf/if_frw_atomic` | atomic helpers (`get_root_key`, `convert_altern_key`, …) | most callbacks |
+
+### 6a. Rules for in-class implementations
+- **Same BO**: always use `io_read` / `io_modify`. Do **not** call `/bobf/cl_tra_serv_mgr_factory=>get_service_manager(...)` for the BO that owns this class — it creates a second buffer view and can cause inconsistencies / endless determination loops.
+- **Different BO (XBO read/write)**: the Service Manager is the only option (`io_read`/`io_modify` are bound to the current BO). Reuse a single instance per BO key, as per Rule 1.
+- **No `save( )`**: the framework owns the LUW. Never instantiate the Transaction Manager here (Rule 4).
+- **Messages**: always use the framework-supplied `eo_message` / `co_message`; create a fresh container at entry only if it is initial:
+  ```abap
+  IF eo_message IS NOT BOUND.
+    eo_message = /bobf/cl_frw_factory=>get_message( ).
+  ENDIF.
+  ```
+- **Failed keys**: `CLEAR et_failed_key` at the top, and `APPEND` any key you could not process — the framework uses this list to skip downstream determinations.
+- **`it_key` is authoritative**: only operate on keys delivered by the framework; validate `<param>-tor_key` (or similar) against `it_key` before processing, so the action never touches an instance it was not invoked for.
+- **One read, one write**: retrieve everything you need in a single `io_read->retrieve( )` (or RBA) call, build the full modification table in memory, then call `io_modify->do_modify( )` **once** at the end — never inside the loop.
+- **Action parameters**: typed via `is_parameters TYPE REF TO data`. `ASSIGN is_parameters->* TO <parameters>` against the action-specific structure type and check `IS ASSIGNED AND IS NOT INITIAL` before using.
+- **Guard the final `do_modify`**: only call it if you actually produced modifications (`IF mod_tab IS NOT INITIAL.`); calling with an empty table is a needless framework round-trip.
+
+### 6b. `io_read` — same signature as `service_manager->retrieve(...)`, minus the BO key
+```abap
+io_read->retrieve(
+  EXPORTING iv_node       = /scmtms/if_tor_c=>sc_node-root
+            it_key        = it_key
+            iv_fill_data  = abap_true
+  IMPORTING et_data       = tor_root_data
+            et_failed_key = et_failed_key ).
+```
+RBA: `io_read->retrieve_by_association( iv_node = … iv_association = … it_key = … IMPORTING et_data = … et_target_key = … )`.
+
+### 6c. `io_modify` — collect, then `do_modify` once
+Use `/SCMTMS/CL_MOD_HELPER` (preferred) or hand-built `/BOBF/T_FRW_MODIFICATION` rows. Always set `changed_fields` for updates so only the relevant determinations fire downstream.
+```abap
+/scmtms/cl_mod_helper=>mod_update_single(
+  EXPORTING is_data            = <tor_root>
+            iv_node            = /scmtms/if_tor_c=>sc_node-root
+            iv_key             = <tor_root>-key
+            it_changed_fields  = VALUE #( ( zif_enh_tor=>sc_node_attribute-root-zoutput_options )
+                                          ( zif_enh_tor=>sc_node_attribute-root-zoutput_opt_chg_datetime ) )
+            iv_autofill_fields = abap_false
+  IMPORTING es_mod             = DATA(mod_line) ).
+APPEND mod_line TO mod_tab.
+...
+IF mod_tab IS NOT INITIAL.
+  io_modify->do_modify( it_modification = mod_tab ).
+ENDIF.
+```
+
+### 6d. Reference implementation — Action with grouped parameters
+Action on TOR root: receives a parameter table of (`tor_key`, `zoutput_options`) entries. Several rows may refer to the same `tor_key`. We must:
+1. read each TOR root **once**,
+2. apply **all** requested options for that key,
+3. emit **one** modification per affected root,
+4. call `io_modify->do_modify( )` **once** at the very end.
+
+```abap
+METHOD /bobf/if_frw_action~execute.
+
+  DATA tor_root_data TYPE /scmtms/t_tor_root_k.
+  DATA mod_tab       TYPE /bobf/t_frw_modification.
+  DATA is_output_set TYPE abap_bool.
+
+  FIELD-SYMBOLS <parameters> TYPE zttm_a_tor_root_out_opt.
+
+  CLEAR et_failed_key.
+
+  " Use the framework message container; create one only if missing
+  IF eo_message IS NOT BOUND.
+    eo_message = /bobf/cl_frw_factory=>get_message( ).
+  ENDIF.
+
+  CHECK it_key IS NOT INITIAL.
+
+  ASSIGN is_parameters->* TO <parameters>.
+  CHECK <parameters> IS ASSIGNED AND <parameters> IS NOT INITIAL.
+
+  " --- READ -------------------------------------------------------------
+  " Same BO ⇒ use IO_READ (NOT the Service Manager). Single mass retrieve.
+  io_read->retrieve(
+    EXPORTING iv_node       = /scmtms/if_tor_c=>sc_node-root
+              it_key        = it_key
+              iv_fill_data  = abap_true
+    IMPORTING et_data       = tor_root_data
+              et_failed_key = et_failed_key ).
+
+  " --- BUILD MODIFICATIONS ---------------------------------------------
+  " Group by TOR_KEY so each root is touched only once, even if multiple
+  " output options are requested for it.
+  LOOP AT <parameters> ASSIGNING FIELD-SYMBOL(<param>)
+                       GROUP BY ( tor_key = <param>-tor_key )
+                       ASSIGNING FIELD-SYMBOL(<param_group>).
+
+    " Guard: the group key must belong to the action's scope
+    IF NOT line_exists( it_key[ KEY key_sort key = <param_group>-tor_key ] ).
+      CONTINUE.
+    ENDIF.
+
+    READ TABLE tor_root_data ASSIGNING FIELD-SYMBOL(<tor_root>)
+                             WITH KEY key = <param_group>-tor_key.
+    IF sy-subrc <> 0.
+      APPEND VALUE #( key = <param_group>-tor_key ) TO et_failed_key.
+      CONTINUE.
+    ENDIF.
+
+    CLEAR is_output_set.
+
+    " Apply every requested option to the same in-memory root
+    LOOP AT GROUP <param_group> ASSIGNING FIELD-SYMBOL(<param_member>).
+      CHECK <param_member>-zoutput_options IS NOT INITIAL.
+
+      zcl_output_options_helper=>set_output_option(
+        EXPORTING i_node_key             = /scmtms/if_tor_c=>sc_node-root
+                  i_single_output_option = CONV #( <param_member>-zoutput_options )
+        CHANGING  c_tor_root             = <tor_root> ).
+
+      is_output_set = abap_true.
+    ENDLOOP.
+
+    CHECK is_output_set = abap_true.
+
+    " One modification line per affected root, accumulated into mod_tab
+    /scmtms/cl_mod_helper=>mod_update_single(
+      EXPORTING is_data            = <tor_root>
+                iv_node            = /scmtms/if_tor_c=>sc_node-root
+                iv_key             = <tor_root>-key
+                it_changed_fields  = VALUE #( ( zif_enh_tor=>sc_node_attribute-root-zoutput_options )
+                                              ( zif_enh_tor=>sc_node_attribute-root-zoutput_opt_chg_datetime ) )
+                iv_autofill_fields = abap_false
+      IMPORTING es_mod             = DATA(mod_line) ).
+    APPEND mod_line TO mod_tab.
+
+  ENDLOOP.
+
+  " --- ONE WRITE --------------------------------------------------------
+  " Single do_modify after the loop; guard against empty table.
+  IF mod_tab IS NOT INITIAL.
+    io_modify->do_modify( it_modification = mod_tab ).
+  ENDIF.
+
+  " NO transaction_manager->save( ) here — the framework owns the LUW.
+ENDMETHOD.
+```
+**Anti-pattern**: calling `io_modify->do_modify( )` inside the GROUP / LOOP, or using `service_manager->modify( )` instead of `io_modify`, or testing `IF tor_root_mod IS NOT INITIAL.` against a variable that was never populated (always guard on the actual `mod_tab`).
+
+## End-to-end skeleton (standalone code)
 1. Declarations → 2. clear exports → 3. instantiate refs → 4. checks → 5. fetch (SELECT only non-BO data; BO data via Service Manager) → 6. build modifications / pick action → 7. modify/do_action, capture failed keys & messages → 8. save via Transaction Manager (standalone only); on reject capture keys & messages.
 ```abap
 METHOD <name>.
@@ -184,15 +336,60 @@ METHOD <name>.
 ENDMETHOD.
 ```
 
+## In-class skeleton (Action / Determination / Validation of the SAME BO)
+```abap
+METHOD /bobf/if_frw_action~execute.    " or determination~execute / validation~execute
+  DATA mod_tab TYPE /bobf/t_frw_modification.
+
+  CLEAR et_failed_key.
+  IF eo_message IS NOT BOUND.
+    eo_message = /bobf/cl_frw_factory=>get_message( ).
+  ENDIF.
+  CHECK it_key IS NOT INITIAL.
+
+  " READ — io_read (NOT service_manager), one call for all keys
+  io_read->retrieve(
+    EXPORTING iv_node      = <BO_C>=>sc_node-root
+              it_key       = it_key
+              iv_fill_data = abap_true
+    IMPORTING et_data       = DATA(root_data)
+              et_failed_key = et_failed_key ).
+
+  " BUILD — accumulate into mod_tab outside any framework call
+  LOOP AT root_data ASSIGNING FIELD-SYMBOL(<root>).
+    " ... mutate <root> in memory ...
+    /scmtms/cl_mod_helper=>mod_update_single(
+      EXPORTING is_data            = <root>
+                iv_node            = <BO_C>=>sc_node-root
+                iv_key             = <root>-key
+                it_changed_fields  = VALUE #( ( <BO_C>=>sc_node_attribute-root-<attr> ) )
+                iv_autofill_fields = abap_false
+      IMPORTING es_mod             = DATA(mod_line) ).
+    APPEND mod_line TO mod_tab.
+  ENDLOOP.
+
+  " WRITE — io_modify (NOT service_manager), single call, guarded
+  IF mod_tab IS NOT INITIAL.
+    io_modify->do_modify( it_modification = mod_tab ).
+  ENDIF.
+  " NO transaction_manager->save( ) — framework owns the LUW.
+ENDMETHOD.
+```
+
 ## Checklist
 ```
-[ ] Service Manager reused, not re-created
+[ ] Service Manager reused, not re-created (standalone code only)
+[ ] Inside Action/Determination/Validation of same BO: io_read / io_modify used, NOT Service Manager
 [ ] QUERY (not SELECT) to find instances; CONVERT_ALTERN_KEY when doc ID known
 [ ] Constants from sc_query/sc_node/sc_action/... — no hard-coded strings/GUIDs
 [ ] iv_fill_data only when data needed now; result_truncated checked; empty keys handled
-[ ] All reads via retrieve/RBA; no BOPF call inside a LOOP
+[ ] All reads via retrieve/RBA; no BOPF call inside a LOOP (incl. io_read / io_modify)
 [ ] do_action preferred; modify is fallback, called once; changed_fields set; get_new_key for creates
-[ ] No COMMIT WORK; save via Transaction Manager, standalone only
-[ ] Helpers checked (/SCMTMS/*HELPER*) before custom code
+[ ] Action parameters: ASSIGN is_parameters->*; checked IS ASSIGNED AND IS NOT INITIAL
+[ ] et_failed_key cleared at entry; failures appended per key
+[ ] eo_message: framework container reused, created only if NOT BOUND
+[ ] mod_tab built fully in memory; io_modify->do_modify called once, guarded by IF mod_tab IS NOT INITIAL
+[ ] No COMMIT WORK; save via Transaction Manager, standalone only (NEVER in Actions/Det./Val.)
+[ ] Helpers checked (/SCMTMS/*HELPER*) before custom code; /SCMTMS/CL_MOD_HELPER for mod lines
 [ ] Clean ABAP + abap-cleaner; mod-log header / BOC-EOC per coding-practices §9
 ```
